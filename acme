@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# safe_acme_install.sh
+# 安全增强版 acme.sh 一键申请脚本（保留：关闭防火墙 / 升级系统 / 执行远程脚本）
+# 特点：
+# - 不使用 set -e，出错时优雅处理并记录日志
+# - 下载远程脚本到本地并显示摘要/校验后由用户确认再执行（避免 curl | sh）
+# - 避免危险 rm -rf（带保护检测）
+# - 对域名、邮箱、端口进行基本校验
+# - 使用 /etc/cron.d/ 的静态 cron 文件（比 crontab 更可靠）
+# - 证书文件权限严格设置（key:600, crt:644）
+# - 日志文件：/var/log/acme_safe_install.log
+#
+# 注意：运行前请确认你了解“关闭防火墙”和“升级系统”的风险
+
+LOGFILE="/var/log/acme_safe_install.log"
+exec 3>&1 4>&2
+# 将 stdout/stderr 同时输出到控制台和日志
+exec 1> >(tee -a "$LOGFILE") 2> >(tee -a "$LOGFILE" >&2)
+
+info() { printf "\e[32m[INFO]\e[0m %s\n" "$*"; }
+warn() { printf "\e[33m[WARN]\e[0m %s\n" "$*" >&2; }
+err()  { printf "\e[31m[ERROR]\e[0m %s\n" "$*" >&2; }
+log()  { printf "[%s] %s\n" "$(date '+%F %T')" "$*"; >> "$LOGFILE"; }
+
+# 小型清理函数（退出时调用）
+TMP_DIR=""
+cleanup() {
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# 交互：读取并校验输入
+read_nonempty() {
+    local varname="$1"; shift
+    local prompt="$*"
+    local val=""
+    while true; do
+        read -p "$prompt" val
+        val="${val#"${val%%[![:space:]]*}"}" # trim left
+        val="${val%"${val##*[![:space:]]}"}" # trim right
+        if [ -n "$val" ]; then
+            eval "$varname=\"\$val\""
+            return 0
+        fi
+        echo "输入不能为空，请重试。"
+    done
+}
+
+# 简单的域名校验（支持带星号的通配符）
+validate_domain() {
+    local d="$1"
+    # 允许 a.b 或 *.a.b
+    if [[ "$d" =~ ^\*\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z]{2,})+$ ]] || \
+       [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z]{2,})+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+validate_email() {
+    local e="$1"
+    if [[ "$e" =~ ^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+validate_port() {
+    local p="$1"
+    if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+        return 0
+    fi
+    return 1
+}
+
+echo "====== 安全增强版 SSL 证书申请脚本 ======"
+read_nonempty DOMAIN "请输入域名（支持通配符，如 *.example.com）： "
+if ! validate_domain "$DOMAIN"; then
+    err "域名格式看起来不对，请确认后重试。"
+    exit 1
+fi
+
+read_nonempty EMAIL "请输入你的电子邮件（用于 acme 注册和通知）： "
+if ! validate_email "$EMAIL"; then
+    err "邮箱格式不正确，请重试。"
+    exit 1
+fi
+
+echo "选择证书颁发机构（CA）："
+echo "1) letsencrypt"
+echo "2) buypass"
+echo "3) zerossl"
+read -p "输入选项(1-3，默认1): " CA_OPTION
+case "$CA_OPTION" in
+    2) CA_SERVER="buypass" ;;
+    3) CA_SERVER="zerossl" ;;
+    *) CA_SERVER="letsencrypt" ;;
+esac
+info "选择 CA: $CA_SERVER"
+
+# 防火墙操作确认（保留你的要求：允许关闭，但需二次确认）
+echo "注意：你已选择保留“关闭防火墙”的功能。关闭防火墙会显著增加被扫描/攻击的风险。"
+read -p "是否确认要关闭防火墙？(y/N): " CONF_FIREWALL
+CONF_FIREWALL=${CONF_FIREWALL:-N}
+if [[ "$CONF_FIREWALL" =~ ^[Yy]$ ]]; then
+    WANT_DISABLE_FIREWALL=1
+else
+    WANT_DISABLE_FIREWALL=0
+fi
+
+# 是否升级系统（保留你的要求）
+read -p "是否执行系统更新与升级（apt/yum upgrade）？(y/N): " CONF_UPGRADE
+CONF_UPGRADE=${CONF_UPGRADE:-N}
+if [[ "$CONF_UPGRADE" =~ ^[Yy]$ ]]; then
+    WANT_UPGRADE=1
+else
+    WANT_UPGRADE=0
+fi
+
+# 端口放行（在不关闭防火墙的情况下）
+PORT=""
+if [ "$WANT_DISABLE_FIREWALL" -ne 1 ]; then
+    read -p "是否需要放行单个端口（如 80 或 443）？(y/N): " CONF_PORT
+    CONF_PORT=${CONF_PORT:-N}
+    if [[ "$CONF_PORT" =~ ^[Yy]$ ]]; then
+        while true; do
+            read -p "请输入端口号: " PORT
+            if validate_port "$PORT"; then break; fi
+            echo "端口无效，请输入 1-65535 之间的数字。"
+        done
+    fi
+fi
+
+# 检测操作系统类型
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="$ID"
+    OS_PRETTY="$PRETTY_NAME"
+else
+    err "无法识别操作系统，脚本退出。"
+    exit 1
+fi
+info "检测到系统：$OS_PRETTY"
+
+# 安装必要依赖（保守安装，不强制升级内核）
+install_dependencies() {
+    case "$OS_ID" in
+        ubuntu|debian)
+            info "更新 apt 索引..."
+            sudo apt update -y || warn "apt update 失败，继续..."
+            if [ "$WANT_UPGRADE" -eq 1 ]; then
+                info "开始执行 apt upgrade -y（可能会较久）..."
+                sudo apt upgrade -y || warn "apt upgrade 失败，继续..."
+            fi
+            sudo apt install -y curl socat git cron ca-certificates || { err "安装依赖失败"; return 1; }
+            ;;
+        centos|rhel|rocky)
+            info "使用 yum 安装依赖..."
+            if [ "$WANT_UPGRADE" -eq 1 ]; then
+                sudo yum update -y || warn "yum update 失败，继续..."
+            fi
+            sudo yum install -y curl socat git cronie ca-certificates || { err "安装依赖失败"; return 1; }
+            sudo systemctl enable --now crond || warn "无法启用 crond"
+            ;;
+        *)
+            warn "不在脚本支持的操作系统列表内，请手动安装 curl/socat/git/cron 等依赖"
+            ;;
+    esac
+    return 0
+}
+
+if ! install_dependencies; then
+    warn "依赖安装有问题，但脚本继续（请检查日志）。"
+fi
+
+# 防火墙控制（尊重用户选择，谨慎执行）
+manage_firewall() {
+    if [ "$WANT_DISABLE_FIREWALL" -eq 1 ]; then
+        info "准备关闭系统防火墙（用户选择）。"
+        case "$OS_ID" in
+            ubuntu|debian)
+                if command -v ufw >/dev/null 2>&1; then
+                    sudo ufw disable && info "ufw 已禁用" || warn "禁用 ufw 失败"
+                else
+                    warn "未检测到 ufw，跳过"
+                fi
+                ;;
+            centos|rhel|rocky)
+                if command -v systemctl >/dev/null 2>&1; then
+                    sudo systemctl stop firewalld && sudo systemctl disable firewalld \
+                        && info "firewalld 已停止并禁用" || warn "停止/禁用 firewalld 失败"
+                else
+                    warn "无法使用 systemctl 操作防火墙"
+                fi
+                ;;
+            *)
+                warn "不支持的 OS 防火墙管理"
+                ;;
+        esac
+    else
+        if [ -n "$PORT" ]; then
+            info "尝试放行端口 $PORT（不关闭防火墙）"
+            case "$OS_ID" in
+                ubuntu|debian)
+                    if command -v ufw >/dev/null 2>&1; then
+                        sudo ufw allow "$PORT" && info "ufw 已放行端口 $PORT" || warn "ufw 放行端口失败"
+                    else
+                        warn "未检测到 ufw，无法自动放行端口。"
+                    fi
+                    ;;
+                centos|rhel|rocky)
+                    if command -v firewall-cmd >/dev/null 2>&1; then
+                        sudo firewall-cmd --permanent --add-port="${PORT}/tcp" && sudo firewall-cmd --reload \
+                            && info "firewalld 已放行端口 $PORT" || warn "firewalld 放行端口失败"
+                    else
+                        warn "未检测到 firewalld，无法自动放行端口。"
+                    fi
+                    ;;
+                *)
+                    warn "无法自动放行端口"
+                    ;;
+            esac
+        fi
+    fi
+}
+
+manage_firewall
+
+# acme.sh 下载并安装（不使用 curl | sh 的管道执行）
+ACME_INSTALLER_URL="https://get.acme.sh"
+TMP_DIR="$(mktemp -d /tmp/acme_safe.XXXX)"
+ACME_INSTALLER="$TMP_DIR/acme_install.sh"
+
+info "将从 $ACME_INSTALLER_URL 下载 acme.sh 安装脚本到本地：$ACME_INSTALLER"
+if ! curl -fsSL "$ACME_INSTALLER_URL" -o "$ACME_INSTALLER"; then
+    warn "下载 acme.sh 安装脚本失败，请检查网络或手动安装 acme.sh"
+else
+    info "安装脚本下载完成，显示前 30 行供检查："
+    echo "---------- begin installer preview ----------"
+    head -n 30 "$ACME_INSTALLER"
+    echo "----------- end installer preview -----------"
+    # 计算 SHA256 摘要以便用户验证
+    SHA256_SUM="$(sha256sum "$ACME_INSTALLER" | awk '{print $1}')"
+    echo "下载脚本 SHA256: $SHA256_SUM"
+    read -p "确认执行此安装脚本吗？(y/N): " CONF_RUN_INSTALL
+    CONF_RUN_INSTALL=${CONF_RUN_INSTALL:-N}
+    if [[ "$CONF_RUN_INSTALL" =~ ^[Yy]$ ]]; then
+        info "执行 acme.sh 本地安装脚本..."
+        # 使用 sh 执行已下载脚本（不是管道执行）
+        (bash "$ACME_INSTALLER") || warn "acme.sh 安装脚本返回非0，请检查日志"
+    else
+        warn "已取消自动安装 acme.sh，请手动安装后重新运行脚本。"
+    fi
+fi
+
+# 确保 acme.sh 可用
+if ! command -v acme.sh >/dev/null 2>&1; then
+    if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+        export PATH="$HOME/.acme.sh:$PATH"
+    fi
+fi
+
+if ! command -v acme.sh >/dev/null 2>&1; then
+    err "acme.sh 未安装或不可用，脚本无法继续。请先手动安装 acme.sh，再次运行。"
+    exit 1
+fi
+
+# 注册账号（注：acme.sh 会自己处理已注册的情况）
+info "使用邮箱 $EMAIL 在 acme 注册（CA: $CA_SERVER）"
+~/.acme.sh/acme.sh --register-account -m "$EMAIL" --server "$CA_SERVER" || warn "注册账户失败或已注册，继续尝试申请证书"
+
+# 申请证书（使用 standalone 模式）
+info "开始申请证书：域名 = $DOMAIN（standalone 模式）"
+# 申请前检查 80/443 端口是否被占用（standalone 会绑定端口）
+check_port_busy() {
+    local p="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn | awk '{print $4}' | grep -E "[:.]${p}$" >/dev/null 2>&1
+    else
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]${p}$" >/dev/null 2>&1
+    fi
+}
+
+# 如果 80 被占用，提示用户
+if check_port_busy 80; then
+    warn "检测到端口 80 正在被占用。standalone 模式需要端口 80（或 443）。请确保端口空闲，或改用 webroot/dns 别的方式。"
+    read -p "是否继续尝试（可能会失败）？(y/N): " CONT_TRY
+    CONT_TRY=${CONT_TRY:-N}
+    if [[ ! "$CONT_TRY" =~ ^[Yy]$ ]]; then
+        err "中止申请。"
+        exit 1
+    fi
+fi
+
+# 执行申请，失败时优雅处理并尝试清理相关域名配置（但不误删目录）
+if ! ~/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" --server "$CA_SERVER"; then
+    warn "证书申请失败。将尝试清理 acme.sh 的该域名记录（安全清理）。"
+    # 安全清理：仅在目录存在且看起来正常时删除
+    ACME_DOMAIN_DIR="$HOME/.acme.sh/${DOMAIN}"
+    if [ -n "$DOMAIN" ] && [[ "$ACME_DOMAIN_DIR" == *".acme.sh/"* ]] && [ -d "$ACME_DOMAIN_DIR" ]; then
+        info "移除目录：$ACME_DOMAIN_DIR（仅限存在时）"
+        rm -rf "$ACME_DOMAIN_DIR"
+    else
+        warn "跳过删除 $ACME_DOMAIN_DIR（安全检查未通过）"
+    fi
+    ~/.acme.sh/acme.sh --remove -d "$DOMAIN" || warn "acme.sh --remove 返回非0"
+    err "证书申请失败，脚本停止。查看日志 $LOGFILE 获取更多信息。"
+    exit 1
+fi
+
+# 安装证书到 /root 下（如需改路径请手动调整）
+KEY_PATH="/root/${DOMAIN}.key"
+CRT_PATH="/root/${DOMAIN}.crt"
+info "安装证书到：私钥 $KEY_PATH，证书 $CRT_PATH"
+~/.acme.sh/acme.sh --installcert -d "$DOMAIN" \
+    --key-file "$KEY_PATH" \
+    --fullchain-file "$CRT_PATH" || { err "证书安装失败"; exit 1; }
+
+# 设置权限
+chmod 600 "$KEY_PATH" || warn "设置私钥权限失败"
+chmod 644 "$CRT_PATH" || warn "设置证书权限失败"
+info "已设置私钥/证书权限（key:600, crt:644）"
+
+# 生成续期脚本（放在 /root/renew_cert.sh）
+RENEW_SCRIPT="/root/renew_cert.sh"
+cat > "$RENEW_SCRIPT" <<EOF
+#!/usr/bin/env bash
+export PATH="\$HOME/.acme.sh:\$PATH"
+/root/.acme.sh/acme.sh --cron --home "\$HOME/.acme.sh" > /var/log/acme_renew.log 2>&1
+EOF
+chmod 700 "$RENEW_SCRIPT" || warn "设置 renew 脚本权限失败"
+
+# 更安全的 cron 配置：写入 /etc/cron.d/（需要 root 权限）
+CRON_FILE="/etc/cron.d/acme_renew_${DOMAIN//\*/wildcard}"
+info "创建 cron 文件：$CRON_FILE"
+cat > "$CRON_FILE" <<EOF
+# Cron for acme renew for $DOMAIN
+0 0 * * * root $RENEW_SCRIPT > /dev/null 2>&1
+EOF
+chmod 644 "$CRON_FILE" || warn "设置 cron 文件权限失败"
+info "已创建 /etc/cron.d/ 形式的定时任务，每天 00:00 执行续期脚本。"
+
+# 总结信息
+echo "========================================="
+echo "✅ 证书申请并安装完成！"
+echo "域名: $DOMAIN"
+echo "证书: $CRT_PATH"
+echo "私钥: $KEY_PATH"
+echo "CA: $CA_SERVER"
+echo "续期脚本: $RENEW_SCRIPT"
+echo "系统日志: $LOGFILE"
+echo "cron 文件: $CRON_FILE"
+echo "注意：请根据你的服务（nginx/hysteria 等）修改配置并重载服务以使用新证书。"
+echo "========================================="
+
+# 结束
+exit 0
